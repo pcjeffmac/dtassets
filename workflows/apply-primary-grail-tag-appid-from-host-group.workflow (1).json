@@ -1,0 +1,113 @@
+{
+  "id": "bb50605e-4a67-4c7d-8710-6a92ff3e46b3",
+  "title": "Apply primary Grail tag AppID from host group",
+  "description": "Every 12h: discovers host groups (metrics, classic entity API, Smartscape) named <number>_..., and ensures an ingest-enrichment rule sets primary_tags.AppID=<number>. Non-matching groups are skipped.",
+  "actor": "42a50d83-7f6b-43e6-b62b-772e240272b0",
+  "owner": "42a50d83-7f6b-43e6-b62b-772e240272b0",
+  "ownerType": "USER",
+  "isPrivate": true,
+  "schemaVersion": 4,
+  "trigger": {
+    "schedule": {
+      "isActive": false,
+      "trigger": {
+        "type": "interval",
+        "intervalMinutes": 720
+      },
+      "rule": null,
+      "filterParameters": {},
+      "timezone": "UTC",
+      "inputs": {}
+    }
+  },
+  "result": null,
+  "type": "STANDARD",
+  "input": {},
+  "hourlyExecutionLimit": 1000,
+  "guide": null,
+  "tasks": {
+    "get_host_groups": {
+      "name": "get_host_groups",
+      "input": {
+        "query": "timeseries c = count(dt.host.cpu.usage), by:{dt.host_group.id}, from:now()-24h, interval:1h\n| filter isNotNull(dt.host_group.id)\n| fields dt.host_group.id"
+      },
+      "action": "dynatrace.automations:execute-dql-query",
+      "position": {
+        "x": 0,
+        "y": 1
+      },
+      "description": "Source 1 (metrics): distinct dt.host_group.id on host metrics, last 24h",
+      "predecessors": []
+    },
+    "list_nodes_with_appid": {
+      "name": "list_nodes_with_appid",
+      "input": {
+        "query": "smartscapeNodes \"*\", from:now()-24h\n| filter isNotNull(primary_tags.AppID)\n| fields id, type, name, primary_tags.AppID\n| sort primary_tags.AppID, type, name\n| limit 1000"
+      },
+      "action": "dynatrace.automations:execute-dql-query",
+      "position": {
+        "x": 0,
+        "y": 3
+      },
+      "conditions": {
+        "states": {
+          "enrich_hosts_and_processes": "OK"
+        }
+      },
+      "description": "Final check: Smartscape nodes that carry the primary Grail tag AppID",
+      "predecessors": [
+        "enrich_hosts_and_processes"
+      ]
+    },
+    "get_host_groups_classic": {
+      "name": "get_host_groups_classic",
+      "input": {
+        "script": "import { monitoredEntitiesClient } from '@dynatrace-sdk/client-classic-environment-v2';\n\nexport default async function () {\n  const groups = [];\n  try {\n    let nextPageKey;\n    do {\n      const page = await monitoredEntitiesClient.getEntities(\n        nextPageKey ? { nextPageKey } : { entitySelector: 'type(HOST_GROUP)', pageSize: 500 }\n      );\n      for (const e of page.entities ?? []) groups.push({ entityId: e.entityId, name: e.displayName });\n      nextPageKey = page.nextPageKey;\n    } while (nextPageKey);\n    return { groups };\n  } catch (e) {\n    return { groups, error: String(e?.message ?? e) };\n  }\n}\n"
+      },
+      "action": "dynatrace.automations:run-javascript",
+      "position": {
+        "x": -1,
+        "y": 1
+      },
+      "description": "Source 2 (classic entity API): type(HOST_GROUP). Never fails the workflow; returns an error note if the API/scope is unavailable.",
+      "predecessors": []
+    },
+    "enrich_hosts_and_processes": {
+      "name": "enrich_hosts_and_processes",
+      "input": {
+        "script": "import { execution } from '@dynatrace-sdk/automation-utils';\nimport { settingsObjectsClient } from '@dynatrace-sdk/client-classic-environment-v2';\n\nconst SCHEMA = 'builtin:ingest.enrichment.config';\nconst TARGET = 'primary_tags.AppID';\nconst q = (s) => s.replace(/\\\\/g, '\\\\\\\\').replace(/\"/g, '\\\\\"');\n\nexport default async function ({ execution_id }) {\n  const ex = await execution(execution_id);\n  // Union of three discovery sources; a failed source contributes nothing\n  const safe = async (id) => { try { return await ex.result(id); } catch { return null; } };\n  const names = new Set();\n  const metrics = await safe('get_host_groups');\n  for (const r of metrics?.records ?? []) names.add(r['dt.host_group.id']);\n  const classic = await safe('get_host_groups_classic');\n  for (const r of classic?.groups ?? []) names.add(r.name);\n  const smart = await safe('get_host_groups_smartscape');\n  for (const r of smart?.records ?? []) names.add(r.name);\n  const sources = {\n    metrics: metrics?.records?.length ?? null,\n    classic: classic?.error ? `error: ${classic.error}` : (classic?.groups?.length ?? null),\n    smartscape: smart?.records?.length ?? null,\n  };\n  const groups = [...names].filter(Boolean).map((n) => ({ 'dt.host_group.id': n }));\n\n  // Existing AppID rules at environment scope, keyed by condition\n  const existing = new Map();\n  let nextPageKey;\n  do {\n    const page = await settingsObjectsClient.getSettingsObjects(\n      nextPageKey ? { nextPageKey } : { schemaIds: SCHEMA, scopes: 'environment', fields: 'objectId,scope,value', pageSize: 500 }\n    );\n    for (const o of page.items ?? []) if (o.value?.target === TARGET && o.value?.condition) existing.set(o.value.condition, o);\n    nextPageKey = page.nextPageKey;\n  } while (nextPageKey);\n\n  const created = [], updated = [], skipped = [], failed = [];\n  for (const g of groups) {\n    const hostGroup = g['dt.host_group.id'];\n    // Host group pattern 100144_ACL_MOD -> AppID 100144\n    const m = /^(\\d+)_/.exec(hostGroup ?? '');\n    if (!m) { skipped.push(hostGroup); continue; }\n    const appId = m[1];\n    const condition = `matchesValue(dt.host_group.id, \"${q(hostGroup)}\")`;\n    const value = { type: 'CUSTOM', valueSource: appId, target: TARGET, condition };\n    try {\n      const cur = existing.get(condition);\n      if (cur && cur.value.valueSource === appId) continue;\n      if (cur) {\n        await settingsObjectsClient.putSettingsObjectByObjectId({ objectId: cur.objectId, body: { value } });\n        updated.push(hostGroup);\n      } else {\n        await settingsObjectsClient.postSettingsObjects({ body: [{ schemaId: SCHEMA, scope: 'environment', value }] });\n        created.push(`${hostGroup} -> ${appId}`);\n      }\n    } catch (e) {\n      failed.push({ hostGroup, error: String(e?.message ?? e) });\n    }\n  }\n  if (failed.length) throw new Error('Some rules failed: ' + JSON.stringify(failed));\n  return { sources, created, updated, skipped, total: groups.length };\n}\n"
+      },
+      "action": "dynatrace.automations:run-javascript",
+      "position": {
+        "x": 0,
+        "y": 2
+      },
+      "conditions": {
+        "states": {
+          "get_host_groups": "ANY",
+          "get_host_groups_classic": "ANY",
+          "get_host_groups_smartscape": "ANY"
+        }
+      },
+      "description": "Union host groups from metrics, classic entity API and Smartscape; per host group ensure environment-scope enrichment rule setting primary_tags.AppID to the number before the first underscore",
+      "predecessors": [
+        "get_host_groups",
+        "get_host_groups_classic",
+        "get_host_groups_smartscape"
+      ]
+    },
+    "get_host_groups_smartscape": {
+      "name": "get_host_groups_smartscape",
+      "input": {
+        "query": "smartscapeNodes \"HOST_GROUP\", from:now()-24h\n| fields id, name"
+      },
+      "action": "dynatrace.automations:execute-dql-query",
+      "position": {
+        "x": 1,
+        "y": 1
+      },
+      "description": "Source 3 (Smartscape): HOST_GROUP nodes, last 24h",
+      "predecessors": []
+    }
+  }
+}
